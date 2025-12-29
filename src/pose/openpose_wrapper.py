@@ -1,16 +1,13 @@
 # src/pose/openpose_wrapper.py
 #
-# OpenPose (CMU COCO/MPI-style) via OpenCV DNN backend.
-# Backend: TensorFlow graph (.pb) such as graph_opt.pb (as in LearnOpenCV tutorial).
-#
-# API (Pessoa B):
-#   - OpenPoseWrapper(cfg)
-#   - estimate_hands(frame_bgr) -> Hands(left/right wrist)
-#   - process_frame(frame_bgr, draw_skeleton=False) -> (frame_out, Hands)
+# OpenPose (COCO-style body keypoints) via OpenCV DNN (TensorFlow .pb).
+# Intended use (Pessoa B):
+#   - Initialize once
+#   - Per-frame: estimate_hands(frame_bgr) -> Hands (wrists, with elbow fallback)
 #
 # Notes:
-# - This implementation is optimized for CPU usage and single-person use (global maxima per heatmap).
-# - If you need multi-person, you must parse PAFs (not implemented here).
+# - This model is BODY-only (no 21-point hand keypoints). We use wrists (and elbow fallback).
+# - Wrapper stays "pure": no smoothing, no trails, no game logic. Those live in hand_tracking.py.
 
 import os
 from dataclasses import dataclass
@@ -43,20 +40,27 @@ class OpenPoseConfig:
     # Path to TensorFlow graph (.pb)
     model_path: str = "graph_opt.pb"
 
-    # Inference input resolution (smaller = faster)
-    in_width: int = 320
-    in_height: int = 240
+    # Inference input resolution (bigger = better wrists, slower)
+    in_width: int = 368
+    in_height: int = 368
 
-    # Confidence threshold for keypoints
-    thr: float = 0.2
+    # Thresholds (separados)
+    thr_wrist: float = 0.07        # low to keep wrists when arms go up
+    thr_skeleton: float = 0.15     # higher to avoid messy skeleton debug
+
+    # Preprocessing
+    swap_rb: bool = False          # model-dependent; keep configurable
+    mean: Tuple[float, float, float] = (127.5, 127.5, 127.5)
 
     # If True, uses OpenCV DNN backend/target if available
     prefer_backend: bool = True
 
+    # If True, allow elbow fallback when wrist confidence is low
+    elbow_fallback: bool = True
+
 
 # =========================
-# COCO BODY_PARTS mapping used by common OpenPose models (18+background)
-# (Matches the mapping you posted; Background=18)
+# COCO BODY_PARTS mapping (18 + background)
 # =========================
 BODY_PARTS = {
     "Nose": 0,
@@ -100,10 +104,11 @@ POSE_PAIRS = [
     ["LEye", "LEar"],
 ]
 
-
-# Indices we care about for hands
-R_WRIST = BODY_PARTS["RWrist"]  # 4
-L_WRIST = BODY_PARTS["LWrist"]  # 7
+# Indices we care about
+R_WRIST = BODY_PARTS["RWrist"]   # 4
+L_WRIST = BODY_PARTS["LWrist"]   # 7
+R_ELBOW = BODY_PARTS["RElbow"]   # 3
+L_ELBOW = BODY_PARTS["LElbow"]   # 6
 
 
 class OpenPoseWrapper:
@@ -111,7 +116,7 @@ class OpenPoseWrapper:
     OpenPose model via OpenCV DNN (TensorFlow .pb).
 
     - init loads the network once.
-    - per-frame inference returns wrists (x, y, conf).
+    - per-frame inference returns wrists (x, y, conf), with elbow fallback.
     """
 
     def __init__(self, cfg: OpenPoseConfig):
@@ -123,31 +128,28 @@ class OpenPoseWrapper:
                 f"Tip: set OpenPoseConfig(model_path=...) or put graph_opt.pb next to this file."
             )
 
-        # Import cv2 only after confirming we won't conflict with pyopenpose.
-        # Here we are not using pyopenpose, so it's safe.
         import cv2 as cv
-
         self.cv = cv
         self.net = self.cv.dnn.readNetFromTensorflow(cfg.model_path)
 
-        # Optional: select backend/target
         if cfg.prefer_backend:
-            # These calls exist in OpenCV >= 4.x
             try:
                 self.net.setPreferableBackend(self.cv.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(self.cv.dnn.DNN_TARGET_CPU)
             except Exception:
-                # Not critical; ignore if not supported
                 pass
 
     # -------------------------
-    # Internal: run network + decode all points (single person, global maxima)
+    # Internal: run network + decode all maxima
     # -------------------------
     def _infer_points(self, frame_bgr: np.ndarray) -> Tuple[List[Optional[Tuple[int, int]]], List[float]]:
+        """
+        Returns:
+          - points[i] = (x,y) maxima location (in frame pixels) for each body part, or None if invalid frame
+          - confs[i]  = maxima confidence value
+        """
         if frame_bgr is None or frame_bgr.size == 0:
-            points = [None] * len(BODY_PARTS)
-            confs = [0.0] * len(BODY_PARTS)
-            return points, confs
+            return [None] * len(BODY_PARTS), [0.0] * len(BODY_PARTS)
 
         frame_h, frame_w = frame_bgr.shape[:2]
 
@@ -155,15 +157,17 @@ class OpenPoseWrapper:
             frame_bgr,
             1.0,
             (self.cfg.in_width, self.cfg.in_height),
-            (127.5, 127.5, 127.5),
-            swapRB=True,
+            self.cfg.mean,
+            swapRB=bool(self.cfg.swap_rb),
             crop=False,
         )
         self.net.setInput(blob)
         out = self.net.forward()
 
-        # Most common TF graph outputs shape [1, 57, H, W] or similar;
-        # first 19 channels are the keypoint heatmaps (18 + background).
+        if out.ndim != 4 or out.shape[1] < 19:
+            raise RuntimeError(f"Unexpected network output shape: {out.shape} (expected N x >=19 x H x W)")
+
+        # Keep only keypoint heatmaps (18 + background)
         out = out[:, :19, :, :]
 
         H = out.shape[2]
@@ -174,134 +178,95 @@ class OpenPoseWrapper:
 
         for i in range(len(BODY_PARTS)):
             heatMap = out[0, i, :, :]
-
-            # Find global maxima of the heatMap.
             _, conf, _, point = self.cv.minMaxLoc(heatMap)
 
             x = (frame_w * point[0]) / float(W)
             y = (frame_h * point[1]) / float(H)
 
-            if conf > self.cfg.thr:
-                points.append((int(x), int(y)))
-                confs.append(float(conf))
-            else:
-                points.append(None)
-                confs.append(float(conf))
+            points.append((int(x), int(y)))
+            confs.append(float(conf))
 
         return points, confs
+
+    # -------------------------
+    # Internal: pick wrists with threshold + fallback
+    # -------------------------
+    def _pick_wrists(self, points: List[Optional[Tuple[int, int]]], confs: List[float]) -> Hands:
+        thr = float(self.cfg.thr_wrist)
+
+        # wrists
+        lp = points[L_WRIST] if confs[L_WRIST] >= thr else None
+        lc = confs[L_WRIST] if lp is not None else 0.0
+
+        rp = points[R_WRIST] if confs[R_WRIST] >= thr else None
+        rc = confs[R_WRIST] if rp is not None else 0.0
+
+        # elbow fallback
+        if self.cfg.elbow_fallback:
+            if rp is None and confs[R_ELBOW] >= thr:
+                rp = points[R_ELBOW]
+                rc = confs[R_ELBOW]
+            if lp is None and confs[L_ELBOW] >= thr:
+                lp = points[L_ELBOW]
+                lc = confs[L_ELBOW]
+
+        left = HandPoint(float(lp[0]), float(lp[1]), float(lc)) if lp is not None else HandPoint(None, None, 0.0)
+        right = HandPoint(float(rp[0]), float(rp[1]), float(rc)) if rp is not None else HandPoint(None, None, 0.0)
+        return Hands(left=left, right=right)
 
     # -------------------------
     # Public: wrists only
     # -------------------------
     def estimate_hands(self, frame_bgr: np.ndarray) -> Hands:
         points, confs = self._infer_points(frame_bgr)
-
-        # Left wrist
-        lp = points[L_WRIST]
-        lc = confs[L_WRIST]
-        left = HandPoint(float(lp[0]), float(lp[1]), lc) if lp is not None else HandPoint(None, None, 0.0)
-
-        # Right wrist
-        rp = points[R_WRIST]
-        rc = confs[R_WRIST]
-        right = HandPoint(float(rp[0]), float(rp[1]), rc) if rp is not None else HandPoint(None, None, 0.0)
-
-        return Hands(left=left, right=right)
+        return self._pick_wrists(points, confs)
 
     # -------------------------
-    # Public: full process for demo/debug
+    # Public: optional debug draw (for dev builds)
     # -------------------------
-    def process_frame(self, frame_bgr: np.ndarray, draw_skeleton: bool = False):
+    def draw_debug(
+        self,
+        frame_bgr: np.ndarray,
+        draw_skeleton: bool = True,
+        draw_all_keypoints: bool = False,
+    ):
         """
-        Returns (frame_out, hands)
-        - frame_out: original frame with optional skeleton drawn
-        - hands: wrists (left/right)
+        Returns (frame_out, hands).
+        - Skeleton threshold uses cfg.thr_skeleton
+        - Wrist selection uses cfg.thr_wrist
         """
         if frame_bgr is None or frame_bgr.size == 0:
             return frame_bgr, Hands(HandPoint(None, None, 0.0), HandPoint(None, None, 0.0))
 
         points, confs = self._infer_points(frame_bgr)
-        hands = self.estimate_hands(frame_bgr)
+        hands = self._pick_wrists(points, confs)
 
         out = frame_bgr.copy()
+        thr_skel = float(self.cfg.thr_skeleton)
 
         if draw_skeleton:
-            for pair in POSE_PAIRS:
-                part_from = pair[0]
-                part_to = pair[1]
-                id_from = BODY_PARTS[part_from]
-                id_to = BODY_PARTS[part_to]
+            for a, b in POSE_PAIRS:
+                ia = BODY_PARTS[a]
+                ib = BODY_PARTS[b]
+                if confs[ia] >= thr_skel and confs[ib] >= thr_skel:
+                    pa = points[ia]
+                    pb = points[ib]
+                    if pa is not None and pb is not None:
+                        self.cv.line(out, pa, pb, (0, 255, 0), 2)
 
-                if points[id_from] and points[id_to]:
-                    self.cv.line(out, points[id_from], points[id_to], (0, 255, 0), 2)
-                    self.cv.circle(out, points[id_from], 3, (0, 0, 255), self.cv.FILLED)
-                    self.cv.circle(out, points[id_to], 3, (0, 0, 255), self.cv.FILLED)
+        if draw_all_keypoints:
+            for i in range(len(BODY_PARTS)):
+                p = points[i]
+                if p is None:
+                    continue
+                c = confs[i]
+                color = (0, 255, 0) if c >= thr_skel else (0, 165, 255)
+                self.cv.circle(out, p, 2, color, self.cv.FILLED)
 
-        # Draw wrists for clarity
+        # draw chosen hands
         if hands.left.conf > 0 and hands.left.x is not None and hands.left.y is not None:
-            self.cv.circle(out, (int(hands.left.x), int(hands.left.y)), 6, (0, 255, 0), -1)
-            self.cv.putText(
-                out,
-                f"L {hands.left.conf:.2f}",
-                (int(hands.left.x) + 8, int(hands.left.y) - 8),
-                self.cv.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2,
-                self.cv.LINE_AA,
-            )
-
+            self.cv.circle(out, (int(hands.left.x), int(hands.left.y)), 7, (0, 255, 0), -1)
         if hands.right.conf > 0 and hands.right.x is not None and hands.right.y is not None:
-            self.cv.circle(out, (int(hands.right.x), int(hands.right.y)), 6, (0, 255, 0), -1)
-            self.cv.putText(
-                out,
-                f"R {hands.right.conf:.2f}",
-                (int(hands.right.x) + 8, int(hands.right.y) - 8),
-                self.cv.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2,
-                self.cv.LINE_AA,
-            )
+            self.cv.circle(out, (int(hands.right.x), int(hands.right.y)), 7, (0, 255, 0), -1)
 
         return out, hands
-
-
-# =========================
-# Demo webcam
-# =========================
-if __name__ == "__main__":
-    import cv2 as cv
-
-    # Assumes graph_opt.pb is in the same folder as this file.
-    cfg = OpenPoseConfig(
-        model_path=os.path.join(os.path.dirname(__file__), "graph_opt.pb"),
-        in_width=368,
-        in_height=368,
-        thr=0.05,
-    )
-
-    pose = OpenPoseWrapper(cfg)
-
-    cap = cv.VideoCapture(0, cv.CAP_DSHOW)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
-
-    if not cap.isOpened():
-        raise RuntimeError("Não consegui abrir a webcam (index 0).")
-
-    print("A correr. Carrega 'q' para sair.")
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        out, _hands = pose.process_frame(frame, draw_skeleton=True)
-        cv.imshow("OpenPose (OpenCV DNN) webcam", out)
-
-        if cv.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    cap.release()
-    cv.destroyAllWindows()
