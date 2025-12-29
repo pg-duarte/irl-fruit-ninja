@@ -7,8 +7,8 @@ class Fruit:
 
         # simple physics
         self.vx = 0.0
-        self.vy = -920.0  # initial upward velocity (px/s)
-        self.g  = 900.0   # gravity (px/s^2)
+        self.vy = -420.0  # initial upward velocity (px/s)
+        self.g  = 100.0   # gravity (px/s^2)
 
     def update(self, dt):
         self.vy += self.g * dt

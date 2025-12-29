@@ -42,7 +42,8 @@ def main():
         last_time = now
 
         # Get hands (mock for now; later OpenPose will replace provider internals)
-        hands = provider.get_hands(frame)
+        hands, frame = provider.get_hands(frame)
+
 
         # Update trails from hands
         trails_tracker.update(hands)
