@@ -49,3 +49,15 @@ class Game:
             f for f in self.fruits
             if f.alive and not f.is_offscreen(self.width, self.height)
         ]
+    def draw(self, frame):
+        # draw all fruits (sprites)
+        for fruit in self.fruits:
+            fruit.draw(frame)
+
+        # simple score overlay (optional)
+        import cv2 as cv
+        cv.putText(frame, f"Score: {self.score}", (20, 40),
+                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
+
+        return frame
+
