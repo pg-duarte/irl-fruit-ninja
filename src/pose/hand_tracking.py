@@ -1,17 +1,30 @@
 # src/pose/hand_tracking.py
 # Tracker simples: smoothing (EMA) + hold-last + trails
+# + dynamic jump gating:
+#   rejects detections that are too far AND too fast to be plausible
 
 import time
 import math
 
 
 class HandTracker:
-    def __init__(self, alpha=0.35, hold_frames=6, conf_decay=0.85, trail_len=24, min_conf=0.07):
+    def __init__(
+        self,
+        alpha=0.35,
+        hold_frames=6,
+        conf_decay=0.85,
+        trail_len=24,
+        min_conf=0.07,
+        max_jump_px=160.0,        # soft distance limit (px). <=0 disables.
+        max_speed_px_s=2800.0,    # NEW: allow fast moves if speed is plausible (px/s). <=0 disables.
+    ):
         self.alpha = float(alpha)
         self.hold_frames = int(hold_frames)
         self.conf_decay = float(conf_decay)
         self.trail_len = int(trail_len)
         self.min_conf = float(min_conf)
+        self.max_jump_px = float(max_jump_px)
+        self.max_speed_px_s = float(max_speed_px_s)
         self.reset()
 
     def reset(self):
@@ -27,9 +40,44 @@ class HandTracker:
         a = self.alpha
         return a * float(new) + (1.0 - a) * float(prev)
 
+    def _is_implausible_jump(self, state, x, y, dt):
+        """
+        Return True if (x,y) is a likely "wrist swap / hallucination".
+        Rule: reject only if it's far AND (if enabled) too fast.
+        This keeps fast real slices while blocking teleports across screen.
+        """
+        if state["x"] is None or state["y"] is None:
+            return False
+
+        dx = float(x) - float(state["x"])
+        dy = float(y) - float(state["y"])
+        d2 = dx * dx + dy * dy
+
+        # Distance gate (optional)
+        dist_gate = False
+        if self.max_jump_px > 0:
+            dist_gate = d2 > (self.max_jump_px * self.max_jump_px)
+
+        # Speed gate (optional)
+        speed_gate = False
+        if self.max_speed_px_s > 0 and dt > 1e-6:
+            v2 = d2 / (dt * dt)
+            speed_gate = v2 > (self.max_speed_px_s * self.max_speed_px_s)
+
+        # If speed gate is disabled, fall back to distance only.
+        if self.max_speed_px_s <= 0:
+            return dist_gate
+
+        # Reject only if BOTH far and too fast.
+        return dist_gate and speed_gate
+
     def _update_one(self, state, raw, dt):
         x, y, c = raw
         ok = (c >= self.min_conf) and (x is not None) and (y is not None)
+
+        # Dynamic jump gating (NEW behavior)
+        if ok and self._is_implausible_jump(state, x, y, dt):
+            ok = False
 
         if ok:
             # smoothing
@@ -66,7 +114,7 @@ class HandTracker:
             return
         trail.append((float(state["x"]), float(state["y"]), now, float(state["c"])))
         if len(trail) > self.trail_len:
-            del trail[0:len(trail) - self.trail_len]
+            del trail[0 : len(trail) - self.trail_len]
 
     def update(self, rawL, rawR, t=None):
         now = time.time() if t is None else float(t)
@@ -88,7 +136,7 @@ class HandTracker:
             "Lc": self.L["c"],
             "Rc": self.R["c"],
         }
-        # devolve (x,y,conf) também
+
         L = (self.L["x"], self.L["y"], self.L["c"])
         R = (self.R["x"], self.R["y"], self.R["c"])
         return L, R, self.trailL, self.trailR, met
