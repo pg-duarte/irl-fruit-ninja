@@ -1,14 +1,14 @@
 # src/game/fruit.py
 import os
-import cv2 as cv
-import numpy as np
-
 import random
 
 from pathlib import Path
 
-ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets" / "images"
+import cv2 as cv
+import numpy as np
 
+# assets/images
+ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets" / "images"
 
 
 class Fruit:
@@ -24,48 +24,65 @@ class Fruit:
         self.radius = self.size // 2
         self.alive = True
 
-        # physics
-        # physics (spawner sets vx/vy)
+        # physics (spawner typically sets vx/vy; these are safe defaults)
         self.vx = 0.0
         self.vy = 0.0
         self.g = 900.0
 
+        # rotation
+        self.angle = random.uniform(0.0, 360.0)        # degrees
+        self.omega = random.uniform(-180.0, 180.0)     # deg/s
 
         # load image once
         self.img = self._load_image("watermelon.png")
 
     @classmethod
-    def _load_image(cls, name):
+    def _load_image(cls, name: str):
         if name in cls._img_cache:
             return cls._img_cache[name]
 
-        path = os.path.join(ASSETS_DIR, name)
-        img = cv.imread(path, cv.IMREAD_UNCHANGED)
+        path = ASSETS_DIR / name
+        img = cv.imread(str(path), cv.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(f"Asset not found: {path}")
 
         cls._img_cache[name] = img
         return img
 
-    def update(self, dt):
+    def update(self, dt: float):
         self.vy += self.g * dt
         self.x += self.vx * dt
         self.y += self.vy * dt
 
+        # update rotation
+        self.angle = (self.angle + self.omega * dt) % 360.0
+
     def draw(self, frame):
         h, w = frame.shape[:2]
 
-        img = cv.resize(self.img, (self.size, self.size), interpolation=cv.INTER_AREA)
+        # resize sprite to desired on-screen size
+        img0 = cv.resize(self.img, (self.size, self.size), interpolation=cv.INTER_AREA)
+
+        # rotate around center (keep alpha)
+        M = cv.getRotationMatrix2D((self.radius, self.radius), float(self.angle), 1.0)
+        img = cv.warpAffine(
+            img0,
+            M,
+            (self.size, self.size),
+            flags=cv.INTER_LINEAR,
+            borderMode=cv.BORDER_TRANSPARENT,
+        )
 
         x0 = int(self.x - self.radius)
         y0 = int(self.y - self.radius)
         x1 = x0 + self.size
         y1 = y0 + self.size
 
-        # clip to screen
+        # offscreen quick reject
         if x1 <= 0 or y1 <= 0 or x0 >= w or y0 >= h:
             return
 
+        # clip to frame
         fx0 = max(0, x0)
         fy0 = max(0, y0)
         fx1 = min(w, x1)
@@ -79,9 +96,10 @@ class Fruit:
         roi = frame[fy0:fy1, fx0:fx1]
         sprite = img[iy0:iy1, ix0:ix1]
 
-        if sprite.shape[2] == 4:
-            alpha = sprite[:, :, 3:4] / 255.0
-            roi[:] = (1 - alpha) * roi + alpha * sprite[:, :, :3]
+        # alpha blend if RGBA
+        if sprite.ndim == 3 and sprite.shape[2] == 4:
+            alpha = (sprite[:, :, 3:4].astype(np.float32)) / 255.0
+            roi[:] = (1.0 - alpha) * roi + alpha * sprite[:, :, :3]
         else:
             roi[:] = sprite[:, :, :3]
 
