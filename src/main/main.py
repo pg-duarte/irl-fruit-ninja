@@ -75,10 +75,15 @@ def main():
     )
     tracker = HandTracker(ht_cfg)
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     cv2.namedWindow("Fruit Ninja Test")
 
     last_time = time.time()
+
+    # --- FPS counter state ---
+    fps_last = time.time()
+    fps_count = 0
+    fps = 0.0
 
     while True:
         ret, frame = cap.read()
@@ -110,9 +115,8 @@ def main():
         # --- Game update ---
         game.update(dt, trails_xy)
 
-        # --- Draw fruits ---
-        for fruit in game.fruits:
-            cv2.circle(frame, (int(fruit.x), int(fruit.y)), fruit.radius, (0, 255, 0), -1)
+        # --- Draw fruits (sprites) ---
+        frame = game.draw(frame)
 
         # --- Draw trails with fade (TTL) ---
         _draw_trail(frame, pose_trails.left,  now, base_color_bgr=(255, 0, 0), thickness=2)    # left = blue
@@ -122,9 +126,16 @@ def main():
         cv2.putText(frame, f"Score: {game.score}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-        # optional debug
-        # cv2.putText(frame, f"Lconf:{metrics['left_conf']:.2f}  Rconf:{metrics['right_conf']:.2f}",
-        #             (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # --- FPS update (once per ~1s) ---
+        fps_count += 1
+        if now - fps_last >= 1.0:
+            fps = fps_count / (now - fps_last)
+            fps_count = 0
+            fps_last = now
+
+        # --- FPS draw (top-left corner) ---
+        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         cv2.imshow("Fruit Ninja Test", frame)
 

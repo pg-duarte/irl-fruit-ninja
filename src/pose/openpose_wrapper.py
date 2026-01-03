@@ -127,17 +127,41 @@ class OpenPoseWrapper:
                 f"OpenPose model not found: {cfg.model_path}\n"
                 f"Tip: set OpenPoseConfig(model_path=...) or put graph_opt.pb next to this file."
             )
-
         import cv2 as cv
         self.cv = cv
         self.net = self.cv.dnn.readNetFromTensorflow(cfg.model_path)
 
-        if cfg.prefer_backend:
+        # Default safe: CPU
+        def _set_cpu():
             try:
                 self.net.setPreferableBackend(self.cv.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(self.cv.dnn.DNN_TARGET_CPU)
             except Exception:
                 pass
+            print("[OpenPose] Using CPU")
+
+        if not cfg.prefer_backend:
+            _set_cpu()
+            return
+
+        # Try CUDA (FP16 first), but verify by doing a tiny forward later
+        try:
+            self.net.setPreferableBackend(self.cv.dnn.DNN_BACKEND_CUDA)
+            try:
+                self.net.setPreferableTarget(self.cv.dnn.DNN_TARGET_CUDA_FP16)
+                print("[OpenPose] Requested CUDA FP16")
+            except Exception:
+                self.net.setPreferableTarget(self.cv.dnn.DNN_TARGET_CUDA)
+                print("[OpenPose] Requested CUDA FP32")
+
+            # IMPORTANT: some builds accept setPreferable* but fail on forward.
+            # We'll mark it and validate on first forward call.
+            self._cuda_requested = True
+
+        except Exception:
+            self._cuda_requested = False
+            _set_cpu()
+
 
     # -------------------------
     # Internal: run network + decode all maxima
@@ -145,12 +169,37 @@ class OpenPoseWrapper:
     def _infer_points(self, frame_bgr: np.ndarray) -> Tuple[List[Optional[Tuple[int, int]]], List[float]]:
         """
         Returns:
-          - points[i] = (x,y) maxima location (in frame pixels) for each body part, or None if invalid frame
+          - points[i] = (x,y) maxima location (in frame pixels) for each body part
           - confs[i]  = maxima confidence value
         """
         if frame_bgr is None or frame_bgr.size == 0:
             return [None] * len(BODY_PARTS), [0.0] * len(BODY_PARTS)
 
+        
+                # one-time validation: if CUDA was requested but is invalid, fallback to CPU
+        if getattr(self, "_cuda_requested", False) and not getattr(self, "_cuda_validated", False):
+            try:
+                # run a tiny dummy forward to force backend/target validation
+                dummy = np.zeros((self.cfg.in_height, self.cfg.in_width, 3), dtype=np.uint8)
+                blob0 = self.cv.dnn.blobFromImage(
+                    dummy, 1.0, (self.cfg.in_width, self.cfg.in_height),
+                    self.cfg.mean, swapRB=bool(self.cfg.swap_rb), crop=False
+                )
+                self.net.setInput(blob0)
+                _ = self.net.forward()
+                print("[OpenPose] CUDA validated OK")
+            except Exception as e:
+                # fallback to CPU
+                try:
+                    self.net.setPreferableBackend(self.cv.dnn.DNN_BACKEND_OPENCV)
+                    self.net.setPreferableTarget(self.cv.dnn.DNN_TARGET_CPU)
+                except Exception:
+                    pass
+                print("[OpenPose] CUDA failed at runtime -> fallback to CPU:", str(e))
+            finally:
+                self._cuda_validated = True
+
+        
         frame_h, frame_w = frame_bgr.shape[:2]
 
         blob = self.cv.dnn.blobFromImage(
@@ -194,7 +243,6 @@ class OpenPoseWrapper:
     def _pick_wrists(self, points: List[Optional[Tuple[int, int]]], confs: List[float]) -> Hands:
         thr = float(self.cfg.thr_wrist)
 
-        # wrists
         lp = points[L_WRIST] if confs[L_WRIST] >= thr else None
         lc = confs[L_WRIST] if lp is not None else 0.0
 
