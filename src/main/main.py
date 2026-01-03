@@ -34,7 +34,7 @@ MOUSE_TRAIL_MIN_DIST_PX = 4  # only add a point if mouse moved enough
 POSE_EVERY_N_FRAMES = 2
 POSE_IN_SIZE = 256
 TRAIL_TTL_SEC = 0.6
-CAM_INDEX = 1
+CAM_INDEX = 0
 
 # UI behavior
 DWELL_S = 0.8
