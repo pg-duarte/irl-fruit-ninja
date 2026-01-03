@@ -1,106 +1,149 @@
-# src/main/main.py
-# Teste webcam: OpenPose wrists -> tracker -> desenhar pontos + trails
-# Funciona mesmo correndo diretamente (corrige sys.path)
-
-import os
 import sys
+import os
+import cv2
 import time
-import cv2 as cv
 
-_THIS = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.abspath(os.path.join(_THIS, "..", ".."))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+# --- Fix Python path so "src" is treated as project root ---
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.pose.openpose_wrapper import OpenPose
-from src.pose.hand_tracking import HandTracker
+from game.game_core import Game
 
+from pose.openpose_wrapper import OpenPoseWrapper, OpenPoseConfig
+from pose.hand_tracking import HandTracker, HandTrackingConfig
 
-def draw_point(img, p, label):
-    x, y, c = p
-    if x is None or y is None or c <= 0:
-        return
-    x, y = int(x), int(y)
-    cv.circle(img, (x, y), 8, (255, 255, 255), -1)
-    cv.putText(img, f"{label} {c:.2f}", (x + 10, y - 10),
-               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv.LINE_AA)
+WIDTH, HEIGHT = 640, 480
 
+# === Trail fade settings (EDIT THIS) ===
+TRAIL_TTL_SEC = 4.0          # how long the trail stays visible
+DRAW_SKELETON_DEBUG = False  # set True if you want skeleton lines (slower)
 
-def draw_trail(img, trail, max_age=0.6):
-    now = time.time()
-    pts = [p for p in trail if now - p[2] <= max_age]
+def _fade_color(base_bgr, fade01: float):
+    """fade01: 1.0=full, 0.0=gone"""
+    f = max(0.0, min(1.0, fade01))
+    return (int(base_bgr[0] * f), int(base_bgr[1] * f), int(base_bgr[2] * f))
+
+def _trail_to_xy_list(trail_points, now_t: float):
+    """Convert TrailPoint list -> [(x,y), ...] filtered by TTL."""
+    out = []
+    for p in trail_points:
+        if (now_t - p.t) <= TRAIL_TTL_SEC:
+            out.append((int(p.x), int(p.y)))
+    return out
+
+def _draw_trail(frame, trail_points, now_t: float, base_color_bgr, thickness=2):
+    """Draw segments with fade based on age (TTL)."""
+    # keep only points within TTL
+    pts = [p for p in trail_points if (now_t - p.t) <= TRAIL_TTL_SEC]
     if len(pts) < 2:
         return
-    for i in range(1, len(pts)):
-        x0, y0 = int(pts[i-1][0]), int(pts[i-1][1])
-        x1, y1 = int(pts[i][0]), int(pts[i][1])
-        cv.line(img, (x0, y0), (x1, y1), (255, 255, 255), 2)
 
+    # draw older->newer segments with increasing intensity
+    for i in range(len(pts) - 1):
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        age = now_t - p2.t
+        fade = 1.0 - (age / TRAIL_TTL_SEC)  # 1 -> 0
+        color = _fade_color(base_color_bgr, fade)
+
+        cv2.line(frame, (int(p1.x), int(p1.y)), (int(p2.x), int(p2.y)), color, thickness)
 
 def main():
-    model_path = os.path.join(_ROOT, "src", "pose", "graph_opt.pb")
+    game = Game(WIDTH, HEIGHT)
 
-    pose = OpenPose(model_path=model_path, in_size=368, thr=0.07, elbow_fallback=True, swap_rb=False)
-    tracker = HandTracker(alpha=0.35, hold_frames=6, conf_decay=0.85, trail_len=24, min_conf=0.07)
+    # --- OpenPose model path ---
+    model_path = os.path.join(os.path.dirname(__file__), "..", "pose", "graph_opt.pb")
+    model_path = os.path.abspath(model_path)
 
-    cap = cv.VideoCapture(0, cv.CAP_DSHOW)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
-    if not cap.isOpened():
-        raise RuntimeError("Não consegui abrir a webcam.")
+    pose_cfg = OpenPoseConfig(
+        model_path=model_path,
+        in_width=368,
+        in_height=368,
+        thr_wrist=0.07,
+        thr_skeleton=0.15,
+        elbow_fallback=True,
+        swap_rb=False,
+    )
+    pose = OpenPoseWrapper(pose_cfg)
 
-    show_trails = True
-    last = time.time()
+    # Hand tracker (smoothing + hold-last + trails + velocity)
+    ht_cfg = HandTrackingConfig(
+        min_conf=0.07,
+        ema_alpha=0.35,
+        trail_max_points=120,      # can be bigger because TTL will filter
+        trail_min_conf=0.05,
+        trail_min_dist_px=6.0
+    )
+    tracker = HandTracker(ht_cfg)
+
+    cap = cv2.VideoCapture(1)
+    cv2.namedWindow("Fruit Ninja Test")
+
+    last_time = time.time()
+
+    # --- FPS counter state ---
+    fps_last = time.time()
+    fps_count = 0
     fps = 0.0
 
-    print("q sair | t trails | r reset | +/- threshold")
-
     while True:
-        ok, frame = cap.read()
-        if not ok:
+        ret, frame = cap.read()
+        if not ret:
             break
-        frame = cv.flip(frame, 1)
 
-        rawL, rawR = pose.wrists(frame)
-        L, R, trailL, trailR, met = tracker.update(rawL, rawR)
+        frame = cv2.resize(frame, (WIDTH, HEIGHT))
+        frame = cv2.flip(frame, 1)
 
-        out = frame.copy()
-        draw_point(out, L, "L")
-        draw_point(out, R, "R")
-
-        if show_trails:
-            draw_trail(out, trailL)
-            draw_trail(out, trailR)
-
-        # fps
         now = time.time()
-        dt = now - last
-        last = now
-        if dt > 0:
-            fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
+        dt = now - last_time
+        last_time = now
 
-        cv.putText(out, f"FPS {fps:.1f}", (10, 25), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv.putText(out, f"thr {pose.thr:.2f}", (10, 50), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv.putText(out, f"Lc {met['Lc']:.2f} Lv {met['Lv']:.0f}px/s", (10, 75), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv.putText(out, f"Rc {met['Rc']:.2f} Rv {met['Rv']:.0f}px/s", (10, 97), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # --- Pose inference ---
+        if DRAW_SKELETON_DEBUG:
+            frame, raw_hands = pose.draw_debug(frame, draw_skeleton=True, draw_all_keypoints=False)
+        else:
+            raw_hands = pose.estimate_hands(frame)
 
-        cv.imshow("Pessoa B - wrists + tracking", out)
+        # --- Tracking (smoothing + trails with timestamps) ---
+        smoothed_hands, pose_trails, metrics = tracker.update(raw_hands, t=now)
 
-        k = cv.waitKey(1) & 0xFF
-        if k == ord("q"):
+        # Convert pose_trails -> format that Game.update expects
+        trails_xy = {
+            "left":  _trail_to_xy_list(pose_trails.left, now),
+            "right": _trail_to_xy_list(pose_trails.right, now),
+        }
+
+        # --- Game update ---
+        game.update(dt, trails_xy)
+
+        # --- Draw fruits (sprites) ---
+        frame = game.draw(frame)
+
+        # --- Draw trails with fade (TTL) ---
+        _draw_trail(frame, pose_trails.left,  now, base_color_bgr=(255, 0, 0), thickness=2)    # left = blue
+        _draw_trail(frame, pose_trails.right, now, base_color_bgr=(0, 255, 255), thickness=2)  # right = yellow
+
+        # --- HUD ---
+        cv2.putText(frame, f"Score: {game.score}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        # --- FPS update (once per ~1s) ---
+        fps_count += 1
+        if now - fps_last >= 1.0:
+            fps = fps_count / (now - fps_last)
+            fps_count = 0
+            fps_last = now
+
+        # --- FPS draw (top-left corner) ---
+        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.imshow("Fruit Ninja Test", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:  # ESC
             break
-        if k == ord("t"):
-            show_trails = not show_trails
-        if k == ord("r"):
-            tracker.reset()
-        if k in (ord("+"), ord("=")):
-            pose.thr = min(0.5, pose.thr + 0.01)
-        if k in (ord("-"), ord("_")):
-            pose.thr = max(0.01, pose.thr - 0.01)
 
     cap.release()
-    cv.destroyAllWindows()
-
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
