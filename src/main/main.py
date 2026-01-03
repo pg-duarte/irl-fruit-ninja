@@ -1,149 +1,246 @@
+# src/main/main.py
+
 import sys
 import os
-import cv2
 import time
+import threading
+from typing import Optional, Tuple
 
-# --- Fix Python path so "src" is treated as project root ---
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import cv2
+
+# Treat "src" as project root for imports: game.*, pose.*, ui.*, common.*
+SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
 
 from game.game_core import Game
-
-from pose.openpose_wrapper import OpenPoseWrapper, OpenPoseConfig
-from pose.hand_tracking import HandTracker, HandTrackingConfig
+from pose.openpose_wrapper import OpenPose
+from pose.hand_tracking import HandTracker
 
 WIDTH, HEIGHT = 640, 480
 
-# === Trail fade settings (EDIT THIS) ===
-TRAIL_TTL_SEC = 4.0          # how long the trail stays visible
-DRAW_SKELETON_DEBUG = False  # set True if you want skeleton lines (slower)
+# =========================
+# Performance knobs
+# =========================
 
+# 1) Run pose only every N frames (decimation).
+#    2 = pose at ~15 Hz if camera is ~30 FPS.
+POSE_EVERY_N_FRAMES = 3
+
+# 2) Smaller DNN input => faster inference, less accuracy.
+POSE_IN_SIZE = 256
+
+# Trail fade settings
+TRAIL_TTL_SEC = 4.0
+
+# Camera index (change if needed)
+CAM_INDEX = 1
+
+
+# =========================
+# Capture thread
+# =========================
+class FrameGrabber:
+    """
+    Simple camera reader thread that always keeps the latest frame.
+    This reduces stutter and prevents the main loop from blocking on cap.read().
+    """
+    def __init__(self, cam_index: int):
+        self.cap = cv2.VideoCapture(cam_index)
+        # Try to reduce internal buffering (not supported on all backends)
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        self.lock = threading.Lock()
+        self.latest: Optional[Tuple[float, any]] = None  # (timestamp, frame)
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        return self
+
+    def _loop(self):
+        while self.running:
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.005)
+                continue
+            t = time.time()
+            with self.lock:
+                self.latest = (t, frame)
+
+    def read_latest(self) -> Optional[Tuple[float, any]]:
+        with self.lock:
+            return self.latest
+
+    def stop(self):
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=0.5)
+        self.cap.release()
+
+
+# =========================
+# Trail drawing utils
+# =========================
 def _fade_color(base_bgr, fade01: float):
     """fade01: 1.0=full, 0.0=gone"""
     f = max(0.0, min(1.0, fade01))
     return (int(base_bgr[0] * f), int(base_bgr[1] * f), int(base_bgr[2] * f))
 
+
 def _trail_to_xy_list(trail_points, now_t: float):
-    """Convert TrailPoint list -> [(x,y), ...] filtered by TTL."""
+    """
+    trail_points: [(x,y,t,conf), ...]  (from your HandTracker)
+    -> [(x,y), ...] filtered by TTL.
+    """
     out = []
-    for p in trail_points:
-        if (now_t - p.t) <= TRAIL_TTL_SEC:
-            out.append((int(p.x), int(p.y)))
+    for x, y, t, c in trail_points:
+        if (now_t - t) <= TRAIL_TTL_SEC:
+            out.append((int(x), int(y)))
     return out
 
-def _draw_trail(frame, trail_points, now_t: float, base_color_bgr, thickness=2):
-    """Draw segments with fade based on age (TTL)."""
-    # keep only points within TTL
-    pts = [p for p in trail_points if (now_t - p.t) <= TRAIL_TTL_SEC]
+
+def _draw_trail(frame, trail_points, now_t: float, base_color_bgr, thickness=2, step=1):
+    """
+    Draw trail segments with fade based on age (TTL).
+    step>1 draws fewer segments (faster).
+    """
+    pts = [(x, y, t, c) for (x, y, t, c) in trail_points if (now_t - t) <= TRAIL_TTL_SEC]
     if len(pts) < 2:
         return
 
-    # draw older->newer segments with increasing intensity
+    # optional downsample for speed
+    if step > 1:
+        pts = pts[::step]
+        if len(pts) < 2:
+            return
+
     for i in range(len(pts) - 1):
-        p1 = pts[i]
-        p2 = pts[i + 1]
-        age = now_t - p2.t
+        x1, y1, t1, c1 = pts[i]
+        x2, y2, t2, c2 = pts[i + 1]
+
+        age = now_t - t2
         fade = 1.0 - (age / TRAIL_TTL_SEC)  # 1 -> 0
         color = _fade_color(base_color_bgr, fade)
 
-        cv2.line(frame, (int(p1.x), int(p1.y)), (int(p2.x), int(p2.y)), color, thickness)
+        cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
 
+
+# =========================
+# Main
+# =========================
 def main():
     game = Game(WIDTH, HEIGHT)
 
-    # --- OpenPose model path ---
-    model_path = os.path.join(os.path.dirname(__file__), "..", "pose", "graph_opt.pb")
-    model_path = os.path.abspath(model_path)
+    # OpenPose model path (graph_opt.pb inside src/pose/)
+    model_path = os.path.abspath(os.path.join(SRC_DIR, "pose", "graph_opt.pb"))
 
-    pose_cfg = OpenPoseConfig(
+    # 2) Smaller in_size = faster
+    pose = OpenPose(
         model_path=model_path,
-        in_width=368,
-        in_height=368,
-        thr_wrist=0.07,
-        thr_skeleton=0.15,
+        in_size=POSE_IN_SIZE,
+        thr=0.07,
         elbow_fallback=True,
         swap_rb=False,
     )
-    pose = OpenPoseWrapper(pose_cfg)
 
-    # Hand tracker (smoothing + hold-last + trails + velocity)
-    ht_cfg = HandTrackingConfig(
-        min_conf=0.07,
-        ema_alpha=0.35,
-        trail_max_points=120,      # can be bigger because TTL will filter
-        trail_min_conf=0.05,
-        trail_min_dist_px=6.0
+    tracker = HandTracker(
+        alpha=0.35,
+        hold_frames=6,
+        conf_decay=0.85,
+        trail_len=120,
+        min_conf=0.07
     )
-    tracker = HandTracker(ht_cfg)
 
-    cap = cv2.VideoCapture(1)
+    grabber = FrameGrabber(CAM_INDEX).start()
     cv2.namedWindow("Fruit Ninja Test")
 
-    last_time = time.time()
+    last_loop_t = time.time()
+    frame_idx = 0
 
-    # --- FPS counter state ---
+    # pose cache (to reuse on frames where we skip pose)
+    last_rawL = (None, None, 0.0)
+    last_rawR = (None, None, 0.0)
+
+    # FPS counter
     fps_last = time.time()
     fps_count = 0
     fps = 0.0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            latest = grabber.read_latest()
+            if latest is None:
+                time.sleep(0.005)
+                continue
 
-        frame = cv2.resize(frame, (WIDTH, HEIGHT))
-        frame = cv2.flip(frame, 1)
+            cam_t, frame = latest
 
-        now = time.time()
-        dt = now - last_time
-        last_time = now
+            # Resize/flip in main thread (keeps capture thread minimal)
+            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+            frame = cv2.flip(frame, 1)
 
-        # --- Pose inference ---
-        if DRAW_SKELETON_DEBUG:
-            frame, raw_hands = pose.draw_debug(frame, draw_skeleton=True, draw_all_keypoints=False)
-        else:
-            raw_hands = pose.estimate_hands(frame)
+            now = time.time()
+            dt = now - last_loop_t
+            last_loop_t = now
+            if dt <= 0:
+                dt = 1.0 / 60.0
 
-        # --- Tracking (smoothing + trails with timestamps) ---
-        smoothed_hands, pose_trails, metrics = tracker.update(raw_hands, t=now)
+            # 1) Pose decimation: only run every N frames
+            if (frame_idx % POSE_EVERY_N_FRAMES) == 0:
+                try:
+                    last_rawL, last_rawR = pose.wrists(frame)
+                except Exception:
+                    # If inference fails, keep last known (tracker will decay/hold)
+                    pass
 
-        # Convert pose_trails -> format that Game.update expects
-        trails_xy = {
-            "left":  _trail_to_xy_list(pose_trails.left, now),
-            "right": _trail_to_xy_list(pose_trails.right, now),
-        }
+            frame_idx += 1
 
-        # --- Game update ---
-        game.update(dt, trails_xy)
+            # Tracking every frame (cheap)
+            L, R, trailL, trailR, met = tracker.update(last_rawL, last_rawR, t=now)
 
-        # --- Draw fruits (sprites) ---
-        frame = game.draw(frame)
+            trails_xy = {
+                "left":  _trail_to_xy_list(trailL, now),
+                "right": _trail_to_xy_list(trailR, now),
+            }
 
-        # --- Draw trails with fade (TTL) ---
-        _draw_trail(frame, pose_trails.left,  now, base_color_bgr=(255, 0, 0), thickness=2)    # left = blue
-        _draw_trail(frame, pose_trails.right, now, base_color_bgr=(0, 255, 255), thickness=2)  # right = yellow
+            # Game update/draw
+            game.update(dt, trails_xy)
+            frame = game.draw(frame)
 
-        # --- HUD ---
-        cv2.putText(frame, f"Score: {game.score}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            # Trails draw (optional downsample step=2 to draw fewer segments faster)
+            _draw_trail(frame, trailL, now, base_color_bgr=(255, 0, 0), thickness=2, step=2)
+            _draw_trail(frame, trailR, now, base_color_bgr=(0, 255, 255), thickness=2, step=2)
 
-        # --- FPS update (once per ~1s) ---
-        fps_count += 1
-        if now - fps_last >= 1.0:
-            fps = fps_count / (now - fps_last)
-            fps_count = 0
-            fps_last = now
+            # HUD
+            cv2.putText(frame, f"Score: {game.score}", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-        # --- FPS draw (top-left corner) ---
-        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            # FPS update (~1s)
+            fps_count += 1
+            if now - fps_last >= 1.0:
+                fps = fps_count / (now - fps_last)
+                fps_count = 0
+                fps_last = now
 
-        cv2.imshow("Fruit Ninja Test", frame)
+            cv2.putText(frame, f"FPS: {fps:.1f}", (20, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        if cv2.waitKey(1) & 0xFF == 27:  # ESC
-            break
+            cv2.imshow("Fruit Ninja Test", frame)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC
+                break
+
+    finally:
+        grabber.stop()
+        cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
