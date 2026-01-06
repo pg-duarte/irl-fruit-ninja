@@ -21,8 +21,8 @@ class OpenPose:
     def __init__(
         self,
         model_path,
-        in_size=368,
-        thr=0.07,
+        in_size=512,
+        thr=0.02,
         elbow_fallback=True,
         swap_rb=False,
         heatmap_blur_ksize=5,   # NEW: 0 desliga blur

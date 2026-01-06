@@ -24,7 +24,7 @@ WIDTH, HEIGHT = 640, 480
 # =========================
 # DEV controls
 # =========================
-DEV_MOUSE = True  # True => cursor/click comes from mouse instead of hand
+DEV_MOUSE = False  # True => cursor/click comes from mouse instead of hand
 
 # Mouse slicing trail behavior (DEV)
 MOUSE_TRAIL_MAX_POINTS = 40
@@ -34,7 +34,7 @@ MOUSE_TRAIL_MIN_DIST_PX = 4  # only add a point if mouse moved enough
 POSE_EVERY_N_FRAMES = 2
 POSE_IN_SIZE = 256
 TRAIL_TTL_SEC = 0.6
-CAM_INDEX = 0
+CAM_INDEX = 1
 
 # UI behavior
 DWELL_S = 0.8
