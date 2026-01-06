@@ -9,13 +9,13 @@ import math
 class HandTracker:
     def __init__(
         self,
-        alpha=0.35,               # base smoothing (ainda existe, mas agora é adaptativo)
+        alpha=0.35,               
         hold_frames=6,
         conf_decay=0.85,
         trail_len=24,
         min_conf=0.07,
-        max_jump_px=160.0,        # gate distância (vs predição)
-        max_speed_px_s=2800.0,    # gate velocidade
+        max_jump_px=160.0,        
+        max_speed_px_s=2800.0,    
     ):
         self.alpha = float(alpha)
         self.hold_frames = int(hold_frames)
