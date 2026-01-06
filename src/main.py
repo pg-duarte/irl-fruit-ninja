@@ -3,20 +3,50 @@ import numpy as np
 import pyopencl as cl
 from stabilization.face_detection import detectar_e_preparar_rosto
 from stabilization.stabilizer import GPUImageStabilizer
+import os
+# Força a escolha da primeira plataforma e dispositivo sem perguntar
+os.environ['PYOPENCL_CTX'] = '0' 
+os.environ['PYOPENCL_COMPILER_OUTPUT'] = '1' # Útil para ver erros de kernel
 
 video_path = 'C:\\Users\\marci\\Desktop\\Mega\\TAPDI\\irl-fruit-ninja\\assets\\videos\\FirstVideo.mp4'  # Substitua pelo caminho do seu arquivo
 
 
 def main():
-    #cap = cv2.VideoCapture(0) # Use a webcam como fonte de vídeo
-    cap = cv2.VideoCapture(video_path) # Use um arquivo de vídeo como fonte
+
+    cap = cv2.VideoCapture(0) # Use a webcam como fonte de vídeo
+    # cap = cv2.VideoCapture(video_path) # Use um arquivo de vídeo como fonte
     if not cap.isOpened():
         print("Erro ao abrir o vídeo")
         exit()
 
     # Ler o primeiro frame para inicialização
     ret, first_frame = cap.read()
-    if not ret: return
+    cv2.waitKey(3000)  # Esperar a câmera estabilizar
+    ret, first_frame = cap.read()
+    if not ret:
+        print("Erro ao ler o primeiro frame")
+        return
+    
+    # Loop para capturar frame inicial
+    while True:
+        cv2.imshow('First Frame', first_frame)
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('r'):  # 'r' para renovar frame
+            ret, first_frame = cap.read()
+            
+            if ret:
+                print("Frame renovado")
+        elif key == ord('m'):  # 'm' para seguir em frente
+            print("Iniciando estabilização...")
+            break
+        else:  # Atualizar câmera continuamente
+            ret, first_frame = cap.read()
+            if not ret:
+                print("Erro ao ler frame")
+                return
+    
+    cv2.destroyWindow('First Frame')
 
     # 1. Converter para cinzento e normalizar (OpenCL kernel espera float)
     gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY) / 255.0
@@ -28,12 +58,13 @@ def main():
 
     template, x0, y0, frame_processado = detectar_e_preparar_rosto(first_frame)
     template_normalizado = template/255.0
+    # template_normalizado = template
     cv2.imshow('Deteção e Gravação', template)
     cv2.imshow('Frame processado', frame_processado)
     print(f"Template capturado em: x0={x0}, y0={y0}")
 
     # 3. Inicializar Estabilizador
-    stabilizer = GPUImageStabilizer(template_normalizado, x0, y0, gray.shape, faceMargin=60, numAngles=3)
+    stabilizer = GPUImageStabilizer(template_normalizado, x0, y0, gray.shape, faceMargin=100, numAngles=4)
 
     while True:
         ret, frame = cap.read()
@@ -65,7 +96,7 @@ def main():
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        cv2.waitKey(30)  # Delay in milliseconds (adjust as needed)
+        # cv2.waitKey(30)  # Delay in milliseconds (adjust as needed)
 
     cap.release()
     cv2.destroyAllWindows()

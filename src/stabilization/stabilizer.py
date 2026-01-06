@@ -4,40 +4,59 @@ import numpy as np
 class GPUImageStabilizer:
 
     KERNEL_SOURCE = """
-        // 1. Kernel de Matching (SAD-NCC híbrido)
-        __kernel void match_template_rotated(
+        __kernel void match_template_multi_dims(
             __read_only image2d_t frame,
             __read_only image2d_t templateImg,
             __global float* costMap,
-            int2 frameDim, int2 templateDim,
+            int2 frameDim, 
+            int2 templateDim,
             int offsetX, int offsetY,
-            float startAngle, float angleStep) 
+            float startAngle, float angleStep,
+            float startScale, float scaleStep,
+            int numScales) // Precisamos saber quantas escalas existem
         {
             int x_local = get_global_id(0);
             int y_local = get_global_id(1);
-            int angle_idx = get_global_id(2);
+            
+            // O id 2 agora controla Rotação E Escala
+            int combined_idx = get_global_id(2);
+            int scale_idx = combined_idx % numScales;
+            int angle_idx = combined_idx / numScales;
 
             int x = x_local + offsetX;
             int y = y_local + offsetY;
 
             float angle = startAngle + (angle_idx * angleStep);
+            float scale = startScale + (scale_idx * scaleStep);
+            
             float cosA = cos(angle);
             float sinA = sin(angle);
             float2 centerT = (float2)(templateDim.x * 0.5f, templateDim.y * 0.5f);
 
+            // Verificação de limites básica
             if (x < (frameDim.x - templateDim.x) && y < (frameDim.y - templateDim.y)) {
                 float sumF = 0.0f, sumT = 0.0f, sumFF = 0.0f, sumTT = 0.0f, sumFT = 0.0f;
                 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_LINEAR;
 
+                // Iteramos sobre o tamanho original do template
                 for (int j = 0; j < templateDim.y; j++) {
                     for (int i = 0; i < templateDim.x; i++) {
+                        // Pixel do frame (fixo)
                         float f = read_imagef(frame, sampler, (int2)(x + i, y + j)).x;
 
+                        // Cálculo do ponto no template com Rotação e ESCALA
+                        // p é a distância relativa ao centro
                         float2 p = (float2)(i - centerT.x, j - centerT.y);
+                        
+                        // Aplicamos a escala inversa para "mapear" o tamanho atual do frame de volta ao template
+                        float2 scaledP = p * (1.0f / scale);
+
                         float2 rotP = (float2)(
-                            p.x * cosA - p.y * sinA + centerT.x,
-                            p.x * sinA + p.y * cosA + centerT.y
+                            scaledP.x * cosA - scaledP.y * sinA + centerT.x,
+                            scaledP.x * sinA + scaledP.y * cosA + centerT.y
                         );
+
+                        // Lemos o template (o sampler linear ajuda muito aqui no redimensionamento)
                         float t = read_imagef(templateImg, sampler, rotP).x;
 
                         sumF += f; sumT += t;
@@ -47,21 +66,21 @@ class GPUImageStabilizer:
 
                 float numPixels = (float)(templateDim.x * templateDim.y);
                 
-                // --- SOLUÇÃO PARA O PROBLEMA 2 ---
-                float avgF = sumF / numPixels; // Brilho médio da região atual no vídeo
-                float avgT = sumT / numPixels; // Brilho médio do seu template original
-                float brightnessDiff = fabs(avgF - avgT); // Quão diferentes eles são em brilho?
+                // --- Cálculo de NCC e Brilho ---
+                float avgF = sumF / numPixels;
+                float avgT = sumT / numPixels;
+                float brightnessDiff = fabs(avgF - avgT);
 
                 float numerator = sumFT - (sumF * sumT) / numPixels;
-                float denominator = sqrt((sumFF - (sumF * sumF) / numPixels) * (sumTT - (sumT * sumT) / numPixels));
-                float ncc = (denominator > 0.0001f) ? (numerator / denominator) : 0;
+                float denomVal = (sumFF - (sumF * sumF) / numPixels) * (sumTT - (sumT * sumT) / numPixels);
+                float ncc = (denomVal > 0.0001f) ? (numerator / sqrt(denomVal)) : 0;
 
-                // O custo agora é: (Erro de Forma) + (Erro de Brilho)
-                // Ajuste o peso 0.5f conforme necessário (mais alto = mais rigoroso com a cor)
+                // Custo final
                 float cost = (1.0f - ncc) + (brightnessDiff * 0.5f);
 
-                int angleOffset = angle_idx * (get_global_size(0) * get_global_size(1));
-                costMap[angleOffset + (y_local * get_global_size(0) + x_local)] = cost;
+                // Mapeamento no costMap (X, Y, Combined_Idx)
+                int sliceSize = get_global_size(0) * get_global_size(1);
+                costMap[combined_idx * sliceSize + (y_local * get_global_size(0) + x_local)] = cost;
             }
         }
 
@@ -187,7 +206,7 @@ class GPUImageStabilizer:
         self.res_y_gpu = cl.Buffer(self.ctx, self.mf.READ_WRITE, 4)
         self.res_angle_gpu = cl.Buffer(self.ctx, self.mf.READ_WRITE, 4) # Buffer para o índice do ângulo
 
-    def process(self, frame_np, zoom=1):
+    def process(self, frame_np, zoom=1.2):
         # 0. Upload do frame
         frame_gpu = cl.Image(self.ctx, self.mf.READ_ONLY | self.mf.COPY_HOST_PTR, 
                             self.fmt, shape=(self.w_f, self.h_f), 
@@ -211,11 +230,23 @@ class GPUImageStabilizer:
         t_dim = cl.cltypes.make_int2(self.w_t, self.h_t)
         global_size = (self.w_match, self.h_match, self.num_angles)
 
-        self.prg.match_template_rotated(
+
+
+        # __read_only image2d_t frame,
+        #     __read_only image2d_t templateImg,
+        #     __global float* costMap,
+        #     int2 frameDim, 
+        #     int2 templateDim,
+        #     int offsetX, int offsetY,
+        #     float startAngle, float angleStep,
+        #     float startScale, float scaleStep,
+        #     int numScales) // Precisamos saber quantas escalas existem
+        # {
+        self.prg.match_template_multi_dims(
             self.queue, global_size, None,
             frame_gpu, self.template_gpu, self.cost_map_gpu,
             f_dim, t_dim, np.int32(start_x), np.int32(start_y),
-            start_angle, angle_step
+            start_angle, angle_step, np.float32(1), np.float32(0.2), np.int32(2)
         )
 
         # 2. Redução 3D (CORRIGIDO: nome da função e argumentos)
