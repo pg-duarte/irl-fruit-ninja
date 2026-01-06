@@ -27,10 +27,14 @@ class Spawner:
             # launch velocities scaled (same factor => same height)
             fruit.vx = random.uniform(-200.0, 200.0) * SLOW
             fruit.vy = -random.uniform(1000.0, 1350.0) * SLOW
+<<<<<<< Updated upstream
             
             fruit.omega = random.uniform(-720.0, 720.0)
 
 
+=======
+            fruit.omega = random.uniform(-720.0, 720.0)
+>>>>>>> Stashed changes
             return fruit
         return None
 
