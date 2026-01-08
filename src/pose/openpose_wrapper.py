@@ -2,10 +2,7 @@
 # Wrapper simples: OpenPose (COCO body) via OpenCV DNN (.pb)
 # Devolve só punhos (com fallback para cotovelos)
 #
-# Fix de estabilidade/precisão:
-# - Gaussian blur no heatmap antes de procurar o pico
-# - Refinamento do pico por centro-de-massa numa janela pequena (sub-pixel em coords do heatmap)
-# Isto reduz jitter e picos espúrios sem ficar pesado.
+# + NEW: guarda os keypoints do último forward e permite desenhar o esqueleto completo
 
 import os
 import cv2 as cv
@@ -16,6 +13,15 @@ BODY = {
     "LElbow": 6, "LWrist": 7,
 }
 
+# Ligações COCO (pares de índices) para desenhar esqueleto
+POSE_PAIRS = [
+    (1, 2), (1, 5),
+    (2, 3), (3, 4),
+    (5, 6), (6, 7),
+    (1, 8), (8, 9), (9, 10),
+    (1, 11), (11, 12), (12, 13),
+]
+
 
 class OpenPose:
     def __init__(
@@ -25,8 +31,8 @@ class OpenPose:
         thr=0.02,
         elbow_fallback=True,
         swap_rb=False,
-        heatmap_blur_ksize=5,   # NEW: 0 desliga blur
-        refine_window=3,        # NEW: 0 desliga refinamento; recomendado 3 ou 5
+        heatmap_blur_ksize=5,   # 0 desliga blur
+        refine_window=3,        # 0 desliga refinamento; recomendado 3 ou 5
     ):
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"Modelo não encontrado: {model_path}")
@@ -38,6 +44,10 @@ class OpenPose:
 
         self.heatmap_blur_ksize = int(heatmap_blur_ksize)
         self.refine_window = int(refine_window)
+
+        # NEW: cache do último forward (para desenhar esqueleto)
+        self._last_pts = None
+        self._last_confs = None
 
     def _infer(self, frame):
         h, w = frame.shape[:2]
@@ -64,7 +74,7 @@ class OpenPose:
         for i in range(19):
             hm = out[0, i, :, :]
 
-            # --- NEW: blur para reduzir picos espúrios ---
+            # blur para reduzir picos espúrios
             if self.heatmap_blur_ksize and self.heatmap_blur_ksize >= 3:
                 k = self.heatmap_blur_ksize
                 if k % 2 == 0:
@@ -77,7 +87,7 @@ class OpenPose:
             _, c, _, p = cv.minMaxLoc(hm_s)
             px, py = int(p[0]), int(p[1])
 
-            # --- NEW: refinamento por centro-de-massa numa janela pequena ---
+            # refinamento por centro-de-massa numa janela pequena
             if self.refine_window and self.refine_window >= 3:
                 rw = self.refine_window
                 if rw % 2 == 0:
@@ -90,18 +100,14 @@ class OpenPose:
                 y1 = min(H - 1, py + r)
 
                 patch = hm_s[y0:y1 + 1, x0:x1 + 1]
-                # evita problemas se patch for vazio
                 if patch.size > 0:
-                    # pesos: valores do heatmap (>=0 normalmente)
                     sumv = float(patch.sum())
                     if sumv > 1e-9:
-                        # coordenadas locais
                         xs = 0.0
                         ys = 0.0
                         for yy in range(patch.shape[0]):
                             row = patch[yy, :]
                             y_abs = y0 + yy
-                            # soma ponderada em x
                             for xx in range(patch.shape[1]):
                                 v = float(row[xx])
                                 xs += v * float(x0 + xx)
@@ -132,6 +138,10 @@ class OpenPose:
             pts.append((x, y))
             confs.append(float(c))
 
+        # NEW: guardar para draw_skeleton()
+        self._last_pts = pts
+        self._last_confs = confs
+
         return pts, confs
 
     def wrists(self, frame):
@@ -147,7 +157,25 @@ class OpenPose:
         r, rc = pick(BODY["RWrist"], BODY["RElbow"])
         l, lc = pick(BODY["LWrist"], BODY["LElbow"])
 
-        # devolve (x,y,conf) ou (None,None,0)
         L = (l[0], l[1], lc) if l else (None, None, 0.0)
         R = (r[0], r[1], rc) if r else (None, None, 0.0)
         return L, R
+
+    # NEW: desenhar esqueleto completo (COCO)
+    def draw_skeleton(self, frame):
+        if self._last_pts is None or self._last_confs is None:
+            return frame
+
+        # joints
+        for (x, y), c in zip(self._last_pts, self._last_confs):
+            if c >= self.thr:
+                cv.circle(frame, (int(x), int(y)), 4, (0, 255, 0), -1)
+
+        # bones
+        for i, j in POSE_PAIRS:
+            if self._last_confs[i] >= self.thr and self._last_confs[j] >= self.thr:
+                x1, y1 = self._last_pts[i]
+                x2, y2 = self._last_pts[j]
+                cv.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
+
+        return frame
